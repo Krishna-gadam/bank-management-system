@@ -1,0 +1,267 @@
+import java.sql.*;
+import java.util.Scanner;
+
+public class BankManagementSystem {
+    // ✅ Update these for your MySQL
+    private static final String URL = "jdbc:mysql://localhost:3306/bank_db?serverTimezone=UTC";
+    private static final String USER = "root";
+    private static final String PASSWORD = "root";
+
+    private final Connection conn;
+    private final Scanner sc = new Scanner(System.in);
+
+    public BankManagementSystem() {
+        try {
+            conn = DriverManager.getConnection(URL, USER, PASSWORD);
+            conn.setAutoCommit(true);
+            System.out.println("✅ Connected to MySQL.");
+        } catch (SQLException e) {
+            throw new RuntimeException("Cannot connect to DB: " + e.getMessage());
+        }
+    }
+
+    // ---------- Core Features ----------
+    private void createAccount() {
+        System.out.print("Enter name: ");
+        String name = sc.nextLine().trim();
+        System.out.print("Enter initial deposit: ");
+        double amount = readDoubleNonNeg();
+
+        String sql = "INSERT INTO accounts(name, balance) VALUES(?, ?)";
+        try (PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, name);
+            ps.setDouble(2, amount);
+            ps.executeUpdate();
+            try (ResultSet rs = ps.getGeneratedKeys()) {
+                if (rs.next()) {
+                    int acc = rs.getInt(1);
+                    logTxn(acc, "CREATE", amount, "Initial deposit");
+                    System.out.println("🎉 Account created. Account No: " + acc);
+                }
+            }
+        } catch (SQLException e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+
+    private void deposit() {
+        System.out.print("Account No: ");
+        int acc = readInt();
+        System.out.print("Amount: ");
+        double amt = readDoubleNonNeg();
+
+        String sql = "UPDATE accounts SET balance = balance + ? WHERE account_no = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setDouble(1, amt);
+            ps.setInt(2, acc);
+            int n = ps.executeUpdate();
+            if (n > 0) {
+                logTxn(acc, "DEPOSIT", amt, null);
+                System.out.println("✅ Deposited.");
+            } else System.out.println("❌ Account not found.");
+        } catch (SQLException e) { System.out.println("Error: " + e.getMessage()); }
+    }
+
+    private void withdraw() {
+        System.out.print("Account No: ");
+        int acc = readInt();
+        System.out.print("Amount: ");
+        double amt = readDoubleNonNeg();
+
+        String sel = "SELECT balance FROM accounts WHERE account_no = ? FOR UPDATE";
+        String upd = "UPDATE accounts SET balance = balance - ? WHERE account_no = ?";
+        try {
+            conn.setAutoCommit(false);
+            double bal;
+            try (PreparedStatement ps = conn.prepareStatement(sel)) {
+                ps.setInt(1, acc);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) { System.out.println("❌ Account not found."); conn.rollback(); return; }
+                    bal = rs.getDouble(1);
+                }
+            }
+            if (bal < amt) { System.out.println("❌ Insufficient balance."); conn.rollback(); return; }
+            try (PreparedStatement ps = conn.prepareStatement(upd)) {
+                ps.setDouble(1, amt);
+                ps.setInt(2, acc);
+                ps.executeUpdate();
+            }
+            logTxn(acc, "WITHDRAW", amt, null);
+            conn.commit();
+            System.out.println("✅ Withdrawal successful.");
+        } catch (SQLException e) {
+            try { conn.rollback(); } catch (SQLException ignored) {}
+            System.out.println("Error: " + e.getMessage());
+        } finally { try { conn.setAutoCommit(true); } catch (SQLException ignored) {} }
+    }
+
+    private void transfer() {
+        System.out.print("From Account: ");
+        int from = readInt();
+        System.out.print("To Account: ");
+        int to = readInt();
+        System.out.print("Amount: ");
+        double amt = readDoubleNonNeg();
+
+        if (from == to) { System.out.println("❌ Source and destination cannot be same."); return; }
+
+        String sel = "SELECT balance FROM accounts WHERE account_no = ? FOR UPDATE";
+        String selTo = "SELECT balance FROM accounts WHERE account_no = ? FOR UPDATE";
+        String upd = "UPDATE accounts SET balance = ? WHERE account_no = ?";
+        try {
+            conn.setAutoCommit(false);
+
+            Double balFrom = null, balTo = null;
+
+            try (PreparedStatement ps = conn.prepareStatement(sel)) {
+                ps.setInt(1, from);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) balFrom = rs.getDouble(1);
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(selTo)) {
+                ps.setInt(1, to);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) balTo = rs.getDouble(1);
+                }
+            }
+
+            if (balFrom == null) { System.out.println("❌ Source account not found."); conn.rollback(); return; }
+            if (balTo == null)   { System.out.println("❌ Destination account not found."); conn.rollback(); return; }
+            if (balFrom < amt)   { System.out.println("❌ Insufficient funds."); conn.rollback(); return; }
+
+            try (PreparedStatement ps = conn.prepareStatement(upd)) {
+                ps.setDouble(1, balFrom - amt); ps.setInt(2, from); ps.executeUpdate();
+                ps.setDouble(1, balTo + amt);   ps.setInt(2, to);   ps.executeUpdate();
+            }
+
+            logTxn(from, "TRANSFER_OUT", amt, "To " + to);
+            logTxn(to,   "TRANSFER_IN",  amt, "From " + from);
+
+            conn.commit();
+            System.out.println("✅ Transfer successful.");
+        } catch (SQLException e) {
+            try { conn.rollback(); } catch (SQLException ignored) {}
+            System.out.println("Error: " + e.getMessage());
+        } finally { try { conn.setAutoCommit(true); } catch (SQLException ignored) {} }
+    }
+
+    private void checkBalance() {
+        System.out.print("Account No: ");
+        int acc = readInt();
+        String sql = "SELECT name, balance FROM accounts WHERE account_no = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, acc);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    System.out.println("👤 " + rs.getString("name"));
+                    System.out.println("💰 Balance: " + rs.getDouble("balance"));
+                } else System.out.println("❌ Account not found.");
+            }
+        } catch (SQLException e) { System.out.println("Error: " + e.getMessage()); }
+    }
+
+    private void showTransactions() {
+        System.out.print("Account No: ");
+        int acc = readInt();
+        String sql = "SELECT txn_id, type, amount, txn_time, remarks FROM transactions WHERE account_no = ? ORDER BY txn_time DESC";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, acc);
+            try (ResultSet rs = ps.executeQuery()) {
+                boolean any = false;
+                while (rs.next()) {
+                    any = true;
+                    System.out.printf("#%d | %-12s | %.2f | %s | %s%n",
+                        rs.getInt("txn_id"),
+                        rs.getString("type"),
+                        rs.getDouble("amount"),
+                        rs.getTimestamp("txn_time"),
+                        rs.getString("remarks"));
+                }
+                if (!any) System.out.println("No transactions found.");
+            }
+        } catch (SQLException e) { System.out.println("Error: " + e.getMessage()); }
+    }
+
+    private void deleteAccount() {
+        System.out.print("Account No to delete: ");
+        int acc = readInt();
+        String sql = "DELETE FROM accounts WHERE account_no = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, acc);
+            int n = ps.executeUpdate();
+            if (n > 0) System.out.println("✅ Account (and its transactions) deleted.");
+            else System.out.println("❌ Account not found.");
+        } catch (SQLException e) { System.out.println("Error: " + e.getMessage()); }
+    }
+
+    // ---------- Helpers ----------
+    private void logTxn(int acc, String type, double amount, String remarks) {
+        String sql = "INSERT INTO transactions(account_no, type, amount, remarks) VALUES(?, ?, ?, ?)";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, acc);
+            ps.setString(2, type);
+            ps.setDouble(3, amount);
+            ps.setString(4, remarks);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.out.println("⚠️ Transaction log failed: " + e.getMessage());
+        }
+    }
+
+    private int readInt() {
+        while (true) {
+            try { return Integer.parseInt(sc.nextLine().trim()); }
+            catch (Exception e) { System.out.print("Enter a valid number: "); }
+        }
+    }
+
+    private double readDoubleNonNeg() {
+        while (true) {
+            try {
+                double d = Double.parseDouble(sc.nextLine().trim());
+                if (d < 0) { System.out.print("Enter non-negative amount: "); continue; }
+                return d;
+            } catch (Exception e) { System.out.print("Enter a valid amount: "); }
+        }
+    }
+
+    // ---------- App ----------
+    private void menu() {
+        while (true) {
+            System.out.println("\n===== BANK MANAGEMENT SYSTEM =====");
+            System.out.println("1. Create Account");
+            System.out.println("2. Deposit");
+            System.out.println("3. Withdraw");
+            System.out.println("4. Transfer");
+            System.out.println("5. Check Balance");
+            System.out.println("6. Transaction History");
+            System.out.println("7. Delete Account");
+            System.out.println("8. Exit");
+            System.out.print("Choose: ");
+
+            switch (readInt()) {
+                case 1 -> createAccount();
+                case 2 -> deposit();
+                case 3 -> withdraw();
+                case 4 -> transfer();
+                case 5 -> checkBalance();
+                case 6 -> showTransactions();
+                case 7 -> deleteAccount();
+                case 8 -> { close(); return; }
+                default -> System.out.println("Invalid choice.");
+            }
+        }
+    }
+
+    private void close() {
+        try { if (!conn.getAutoCommit()) conn.setAutoCommit(true); } catch (SQLException ignored) {}
+        try { conn.close(); } catch (SQLException ignored) {}
+        sc.close();
+        System.out.println("👋 Bye!");
+    }
+
+    public static void main(String[] args) {
+        new BankManagementSystem().menu();
+    }
+}
